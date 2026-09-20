@@ -1,6 +1,62 @@
-# Sunshine Steam Game Importer
+# Sunshine Game Importer
 
 This Python script automatically imports your INSTALLED Steam games into Sunshine, a game streaming server, complete with grid images for each game. 
+
+It also imports non-Steam Windows games through game shortcuts, Epic installation
+manifests, and a custom game list. Both `python run.py` and `python main.py` work.
+
+## Non-Steam games
+
+Run `uv run run.py --dry-run --no-restart` to preview Steam and non-Steam changes,
+or `uv run run.py --non-steam-only --no-restart` to add only non-Steam games.
+Omit `--no-restart` to restart Sunshine after saving.
+
+Automatic discovery reads:
+
+- Epic Games installation manifests, using the Epic launcher URI.
+- Desktop and Start Menu shortcuts for known games, including NTE, Wuthering
+  Waves, Star Citizen / RSI Launcher, HoYo games, FiveM, Roblox, and others.
+- Shortcuts in a folder named **Games** and supported game-launcher `.url` shortcuts.
+- Any EXE shortcut placed in a **Sunshine Games** folder on your Desktop or Start Menu.
+
+Star Citizen opens RSI Launcher so you can sign in and launch the desired channel.
+Launchers use Detached Commands, keeping the stream alive when a launcher exits.
+Use Moonlight's Quit Session when finished.
+
+Missing EXE targets are logged and skipped. URI shortcuts may outlive a game
+installation, so remove obsolete shortcuts. Automatic discovery cannot identify
+every portable game or launcher; use `custom_games.json` for anything else:
+
+```json
+[
+  {
+    "name": "My Game",
+    "target": "E:/Games/My Game/launcher.exe",
+    "arguments": ["--game", "my-game"],
+    "working_dir": "E:/Games/My Game",
+    "image_path": "C:/Sunshine_Grids/my-game.png",
+    "enabled": true
+  }
+]
+```
+
+Only `name` and `target` are required. Use an absolute EXE path or a supported
+Steam, Epic, Ubisoft, Battle.net, EA/Origin, or GOG launcher URI. Arguments may be
+a list or the exact argument string from a shortcut. See
+`custom_games.example.json` for the three requested games; its paths are examples,
+not automatically imported. The SteamGridDB API key is optional and is used only
+for Steam artwork. Non-Steam images can be supplied using `image_path`.
+
+`--custom-games PATH` selects another JSON file. `--no-discovery` disables
+automatic non-Steam discovery and uses only that file. Custom definitions override
+discovery for the same name before importing. Existing Sunshine entries and manual
+settings are preserved; edit an already imported entry in Sunshine to change its
+launcher. Non-Steam imports are additive and do not remove entries when a drive is
+offline. Repeated runs skip matching names and launch commands.
+
+Dry runs do not save apps, download artwork, delete images, or restart processes;
+they still write diagnostic logs. Run `uv run python -m unittest -v test_nonsteam`
+for the non-Steam importer checks.
 
 Example: 
 ![IMG_0759](https://github.com/user-attachments/assets/365301a4-57d8-4b5e-a9d6-5ba4573af638)
@@ -23,7 +79,7 @@ Before you begin, ensure you have met the following requirements:
 - **Python 3.12 or higher** installed
 - **uv package manager** (recommended) or pip
 - **Sunshine** installed and configured
-- **A SteamGridDB API key** (get one from [SteamGridDB](https://www.steamgriddb.com/profile/preferences/api))
+- **An optional SteamGridDB API key** for Steam artwork (get one from [SteamGridDB](https://www.steamgriddb.com/profile/preferences/api))
 
 ## Installation
 
@@ -65,6 +121,7 @@ The script now uses environment variables for configuration. Create a `.env` fil
 STEAM_LIBRARY_VDF_PATH=C:/Program Files (x86)/Steam/steamapps/libraryfolders.vdf
 SUNSHINE_APPS_JSON_PATH=C:/Program Files/Sunshine/config/apps.json
 SUNSHINE_GRIDS_FOLDER=C:/Sunshine_Grids
+# Optional, for Steam artwork
 STEAMGRIDDB_API_KEY=your_api_key_here
 
 # Optional variables (for Windows process restart)
@@ -130,6 +187,7 @@ uv run main.py --verbose --dry-run
 
 ### Common Issues
 
+- **Stream closes immediately with a DRM-content warning**: Older Windows imports tracked Steam's short-lived URI launcher as the game process. Run the updated importer to migrate those entries to Sunshine's Detached Commands. The stream stays open after Steam finishes launching; use Moonlight's Quit Session when finished. Existing game names and artwork are preserved.
 - **"Invalid argument" errors**: Check your `.env` file paths use forward slashes `/` or double backslashes `\\`
 - **"Access Denied" errors**: Run with administrator privileges on Windows
 - **API rate limiting**: The script includes automatic retry logic with backoff

@@ -1,0 +1,19 @@
+[
+    {
+        "name": "Wuthering Waves",
+        "target": "E:/Games/Wuthering Waves/launcher.exe",
+        "arguments": [],
+        "image_path": "",
+        "enabled": true
+    },
+    {
+        "name": "NTE (Standalone)",
+        "target": "E:/Games/Neverness To Everness/NTEGlobal/NTEGlobalLauncher.exe",
+        "enabled": true
+    },
+    {
+        "name": "Star Citizen",
+        "target": "E:/Program Files/Roberts Space Industries/RSI Launcher/RSI Launcher.exe",
+        "enabled": true
+    }
+]

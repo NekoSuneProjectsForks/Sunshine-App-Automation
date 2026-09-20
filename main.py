@@ -16,6 +16,8 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Dict, List, Optional, Set, Tuple
 from urllib.parse import urljoin
 from dotenv import load_dotenv
+from pathlib import Path
+from nonsteam import discover_games, merge_games
 
 # Configuration and logging setup
 def setup_logging(verbose: bool = False) -> None:
@@ -48,16 +50,16 @@ def normalize_path(path: str) -> str:
     
     return path
 
-def validate_config() -> Dict[str, str]:
+def validate_config(include_steam: bool = True) -> Dict[str, str]:
     """Load and validate configuration from environment variables."""
     load_dotenv()
     
     required_vars = {
-        'steam_library_vdf_path': 'Steam library VDF file path',
-        'sunshine_apps_json_path': 'Sunshine apps.json file path',
-        'sunshine_grids_folder': 'Sunshine grids folder path',
-        'steamgriddb_api_key': 'SteamGridDB API key'
+        'SUNSHINE_APPS_JSON_PATH': 'Sunshine apps.json file path',
+        'SUNSHINE_GRIDS_FOLDER': 'Sunshine grids folder path'
     }
+    if include_steam:
+        required_vars['STEAM_LIBRARY_VDF_PATH'] = 'Steam library VDF file path'
     
     config = {}
     missing_vars = []
@@ -79,13 +81,14 @@ def validate_config() -> Dict[str, str]:
     
     config['STEAM_EXE_PATH'] = normalize_path(steam_exe) if steam_exe else ''
     config['SUNSHINE_EXE_PATH'] = normalize_path(sunshine_exe) if sunshine_exe else ''
+    config['STEAMGRIDDB_API_KEY'] = os.getenv('STEAMGRIDDB_API_KEY', '')
     
     if missing_vars:
         logging.error(f"Missing required environment variables: {', '.join(missing_vars)}")
         sys.exit(1)
     
     # Validate paths exist
-    if not os.path.exists(config['STEAM_LIBRARY_VDF_PATH']):
+    if include_steam and not os.path.exists(config['STEAM_LIBRARY_VDF_PATH']):
         logging.error(f"Steam library VDF file not found: {config['STEAM_LIBRARY_VDF_PATH']}")
         sys.exit(1)
     
@@ -140,6 +143,21 @@ def restart_sunshine(sunshine_exe_path: str) -> None:
     """Restart Sunshine application safely."""
     if os.name != 'nt':
         logging.warning("Sunshine restarting is only supported on Windows. Please restart Sunshine manually.")
+        return
+
+    # Let the installed service manage its child process; starting another copy
+    # alongside it can race for the streaming ports.
+    try:
+        psutil.win_service_get('SunshineService')
+    except psutil.NoSuchProcess:
+        pass
+    else:
+        logging.info('Restarting SunshineService...')
+        subprocess.run(
+            ['powershell.exe', '-NoProfile', '-NonInteractive', '-Command',
+             "Restart-Service -Name SunshineService -ErrorAction Stop"],
+            check=True, timeout=90, creationflags=subprocess.CREATE_NO_WINDOW)
+        logging.info('Sunshine service restart completed')
         return
     
     if not sunshine_exe_path or not os.path.exists(sunshine_exe_path):
@@ -209,6 +227,8 @@ def get_game_name(app_id: str) -> Optional[str]:
 
 def fetch_grid_from_steamgriddb(app_id: str, api_key: str, grids_folder: str) -> Optional[str]:
     """Fetch game grid image from SteamGridDB with retry logic."""
+    if not api_key:
+        return None
     url = f"https://www.steamgriddb.com/api/v2/grids/steam/{app_id}"
     headers = {"Authorization": f"Bearer {api_key}"}
     
@@ -366,6 +386,37 @@ def load_installed_games(library_vdf_path: str) -> Dict[str, str]:
     logging.info(f"Found {len(installed_games)} installed games")
     return installed_games
 
+def steam_app_id(app: Dict) -> Optional[str]:
+    """Recognize both legacy tracked and detached Windows Steam launchers."""
+    command = app.get('cmd') or ''
+    detached = app.get('detached') or []
+    if isinstance(detached, str):
+        detached = [detached]
+    commands = [command] if command else detached
+    for command in commands:
+        if isinstance(command, str) and command.startswith('steam://rungameid/'):
+            app_id = command.removeprefix('steam://rungameid/')
+            if app_id.isdigit():
+                return app_id
+    return None
+
+
+def detach_steam_launcher(app: Dict) -> Dict:
+    """Do not tie a streaming session to Steam's short-lived URI handler."""
+    command = app.get('cmd') or ''
+    if not command.startswith('steam://rungameid/'):
+        return app
+    updated = app.copy()
+    detached = app.get('detached') or []
+    if isinstance(detached, str):
+        detached = [detached]
+    updated['detached'] = list(detached)
+    if command not in updated['detached']:
+        updated['detached'].append(command)
+    updated['cmd'] = ''
+    return updated
+
+
 def process_existing_apps(sunshine_config: Dict, installed_games: Dict[str, str]) -> Tuple[List[Dict], List[Tuple[str, str]], Set[str]]:
     """Process existing Sunshine apps and identify changes."""
     updated_apps = []
@@ -373,21 +424,14 @@ def process_existing_apps(sunshine_config: Dict, installed_games: Dict[str, str]
     existing_steam_apps = set()
     
     for app in sunshine_config.get('apps', []):
-        if 'cmd' in app and app['cmd'].startswith('steam://rungameid/'):
-            app_id = app['cmd'].split('/')[-1]
+        app_id = steam_app_id(app)
+        if app_id is not None:
             if app_id in installed_games:
-                updated_apps.append(app)
+                updated_apps.append(detach_steam_launcher(app))
                 existing_steam_apps.add(app_id)
             else:
                 removed_games.append((app.get('name', 'Unknown'), app_id))
-                # Clean up grid image
-                grid_path = app.get('image-path')
-                if grid_path and os.path.exists(grid_path):
-                    try:
-                        os.remove(grid_path)
-                        logging.debug(f"Removed grid image: {grid_path}")
-                    except Exception as e:
-                        logging.warning(f"Failed to remove grid image {grid_path}: {e}")
+                # Retain artwork: it may be shared, and discovery must be read-only.
         else:
             # Keep non-Steam apps
             updated_apps.append(app)
@@ -437,9 +481,9 @@ def add_new_games(new_games: Set[str], installed_games: Dict[str, str], api_key:
                 
                 new_app = {
                     "name": game_name,
-                    "cmd": cmd,
+                    "cmd": "" if os.name == 'nt' else cmd,
                     "output": "",
-                    "detached": "",
+                    "detached": [cmd] if os.name == 'nt' else [],
                     "elevated": "false",
                     "hidden": "true",
                     "wait-all": "true",
@@ -459,35 +503,44 @@ def add_new_games(new_games: Set[str], installed_games: Dict[str, str], api_key:
 
 def main() -> None:
     """Main application function."""
-    parser = argparse.ArgumentParser(description='Sunshine Steam Game Automation')
+    parser = argparse.ArgumentParser(description='Sunshine Steam and Non-Steam Game Automation')
     parser.add_argument('--verbose', '-v', action='store_true', help='Enable verbose logging')
     parser.add_argument('--no-restart', action='store_true', help='Skip restarting Steam and Sunshine')
     parser.add_argument('--dry-run', action='store_true', help='Show what would be done without making changes')
+    parser.add_argument('--non-steam-only', action='store_true', help='Import non-Steam games without scanning or restarting Steam')
+    parser.add_argument('--no-discovery', action='store_true', help='Only use custom_games.json for non-Steam games')
+    parser.add_argument('--custom-games', default=str(Path(__file__).with_name('custom_games.json')), help='Custom non-Steam game definitions (JSON)')
     args = parser.parse_args()
     
     # Setup logging
     setup_logging(args.verbose)
-    logging.info("Starting Sunshine Steam Game Automation")
+    logging.info("Starting Sunshine Steam and Non-Steam Game Automation")
     
     try:
         # Load and validate configuration
-        config = validate_config()
+        config = validate_config(include_steam=not args.non_steam_only)
+        nonsteam_apps = discover_games(args.custom_games, auto=not args.no_discovery)
         
         # Restart Steam before processing (unless disabled)
-        if not args.no_restart:
+        if not args.no_restart and not args.dry_run and not args.non_steam_only:
             restart_steam(config['STEAM_EXE_PATH'])
         
         # Load installed games
-        installed_games = load_installed_games(config['STEAM_LIBRARY_VDF_PATH'])
+        installed_games = {} if args.non_steam_only else load_installed_games(config['STEAM_LIBRARY_VDF_PATH'])
         
         # Load Sunshine configuration
         sunshine_config = get_sunshine_config(config['SUNSHINE_APPS_JSON_PATH'])
         
         # Ensure grids folder exists
-        os.makedirs(config['SUNSHINE_GRIDS_FOLDER'], exist_ok=True)
+        if not args.dry_run:
+            os.makedirs(config['SUNSHINE_GRIDS_FOLDER'], exist_ok=True)
         
         # Process existing apps
-        updated_apps, removed_games, existing_steam_apps = process_existing_apps(sunshine_config, installed_games)
+        if args.non_steam_only:
+            updated_apps, removed_games, existing_steam_apps = list(sunshine_config['apps']), [], set()
+        else:
+            updated_apps, removed_games, existing_steam_apps = process_existing_apps(sunshine_config, installed_games)
+        updated_apps = merge_games(updated_apps, nonsteam_apps)
         
         # Find new games to add
         new_games = set(installed_games.keys()) - existing_steam_apps
@@ -498,7 +551,11 @@ def main() -> None:
         if new_games:
             logging.info(f"New games to add: {[installed_games[app_id] for app_id in new_games]}")
         
-        if not removed_games and not new_games:
+        launchers_changed = updated_apps != sunshine_config.get('apps', [])
+        if launchers_changed and not removed_games:
+            logging.info("Application list or launcher settings need updating")
+
+        if not removed_games and not new_games and not launchers_changed:
             logging.info("No changes needed - all games are up to date")
             return
         
